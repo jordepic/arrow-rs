@@ -237,11 +237,28 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             .as_mut()
             .unwrap_or_else(|| panic!("decoder for encoding {encoding} should be set"));
 
-        // TODO: Push vec into decoder (#5177)
         let start = out.len();
-        out.resize(start + num_values, T::T::default());
-        let read = current_decoder.get(&mut out[start..])?;
-        out.truncate(start + read);
+        out.reserve(num_values);
+        let read = match current_decoder.get_uninit(&mut out.spare_capacity_mut()[..num_values]) {
+            Ok(read) => read,
+            Err(error) => {
+                if std::mem::needs_drop::<T::T>() {
+                    // SAFETY: the `get_uninit` contract guarantees that all
+                    // slots are initialized on error for types requiring drop.
+                    unsafe {
+                        out.set_len(start + num_values);
+                    }
+                    out.truncate(start);
+                }
+                return Err(error);
+            }
+        };
+        debug_assert!(read <= num_values);
+        // SAFETY: `get_uninit` guarantees that its first `read` outputs are
+        // initialized on success, and `read` cannot exceed `num_values`.
+        unsafe {
+            out.set_len(start + read);
+        }
         Ok(read)
     }
 

@@ -34,7 +34,10 @@
 //! repeated-value := value that is repeated, using a fixed-width of
 //! round-up-to-next-byte(bit-width)
 
-use std::{cmp, mem::size_of};
+use std::{
+    cmp,
+    mem::{MaybeUninit, size_of},
+};
 
 use bytes::Bytes;
 
@@ -611,6 +614,127 @@ impl RleDecoder {
         Ok(values_read)
     }
 
+    /// Decode dictionary values directly into uninitialized output.
+    ///
+    /// On success, the first `Ok(n)` entries in `buffer` are initialized.
+    /// Entries after `n` remain uninitialized.
+    #[inline(never)]
+    pub fn get_batch_with_dict_uninit<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [MaybeUninit<T>],
+        max_values: usize,
+    ) -> Result<usize>
+    where
+        T: Clone,
+    {
+        debug_assert!(buffer.len() >= max_values);
+
+        let mut values_read = 0;
+        while values_read < max_values {
+            let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+
+            if self.rle_left > 0 {
+                let num_values = cmp::min(max_values - values_read, self.rle_left as usize);
+                let dict_idx = self.current_value.unwrap() as usize;
+                let dict_value = dict.get(dict_idx).ok_or_else(|| {
+                    general_err!(
+                        "dictionary index out of bounds: the len is {} but the index is {}",
+                        dict.len(),
+                        dict_idx
+                    )
+                })?;
+
+                for value in &mut buffer[values_read..values_read + num_values] {
+                    value.write(dict_value.clone());
+                }
+
+                self.rle_left -= num_values as u32;
+                values_read += num_values;
+            } else if self.bit_packed_left > 0 {
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+
+                loop {
+                    let to_read = index_buf
+                        .len()
+                        .min(max_values - values_read)
+                        .min(self.bit_packed_left as usize);
+
+                    if to_read == 0 {
+                        break;
+                    }
+
+                    let num_values = bit_reader
+                        .get_batch::<i32>(&mut index_buf[..to_read], self.bit_width as usize);
+                    if num_values == 0 {
+                        // Handle writers which truncate the final block
+                        self.bit_packed_left = 0;
+                        break;
+                    }
+
+                    {
+                        #[cold]
+                        #[inline(never)]
+                        fn oob(max_idx: u32, dict_len: usize) -> ParquetError {
+                            general_err!(
+                                "dictionary index out of bounds: the len is {} but the index is {}",
+                                dict_len,
+                                max_idx
+                            )
+                        }
+
+                        const CHUNK: usize = 16;
+                        let out = &mut buffer[values_read..values_read + num_values];
+                        let idx = &index_buf[..num_values];
+                        let dict_len = dict.len();
+                        let mut out_chunks = out.chunks_exact_mut(CHUNK);
+                        let idx_chunks = idx.chunks_exact(CHUNK);
+
+                        for (out_chunk, idx_chunk) in out_chunks.by_ref().zip(idx_chunks) {
+                            let max_idx =
+                                idx_chunk.iter().fold(0u32, |acc, &i| acc.max(i as u32));
+                            if (max_idx as usize) >= dict_len {
+                                return Err(oob(max_idx, dict_len));
+                            }
+                            for (value, index) in out_chunk.iter_mut().zip(idx_chunk.iter()) {
+                                // SAFETY: all indices in the chunk were checked above.
+                                value.write(unsafe {
+                                    dict.get_unchecked(*index as usize).clone()
+                                });
+                            }
+                        }
+
+                        for (value, index) in out_chunks
+                            .into_remainder()
+                            .iter_mut()
+                            .zip(idx.chunks_exact(CHUNK).remainder().iter())
+                        {
+                            let dict_idx = *index as usize;
+                            if dict_idx >= dict_len {
+                                return Err(oob(*index as u32, dict_len));
+                            }
+                            // SAFETY: the index was checked immediately above.
+                            value.write(unsafe { dict.get_unchecked(dict_idx).clone() });
+                        }
+                    }
+
+                    self.bit_packed_left -= num_values as u32;
+                    values_read += num_values;
+                    if num_values < to_read {
+                        break;
+                    }
+                }
+            } else if !self.reload()? {
+                break;
+            }
+        }
+
+        Ok(values_read)
+    }
+
     #[inline]
     fn reload(&mut self) -> Result<bool> {
         let bit_reader = self
@@ -799,6 +923,22 @@ mod tests {
         let result = decoder.get_batch_with_dict::<i32>(&dict, &mut buffer, 12);
         assert!(result.is_ok());
         assert_eq!(buffer, expected);
+
+        let data = vec![0x06, 0x00, 0x08, 0x01, 0x0A, 0x02];
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(data.into()).unwrap();
+        let mut uninit = vec![MaybeUninit::uninit(); 12];
+        let read = decoder
+            .get_batch_with_dict_uninit(&dict, &mut uninit, 12)
+            .unwrap();
+        assert_eq!(read, 12);
+        // SAFETY: `get_batch_with_dict_uninit` initialized the first `read`
+        // values, and `read` equals the buffer length.
+        let decoded: Vec<_> = uninit
+            .into_iter()
+            .map(|value| unsafe { value.assume_init() })
+            .collect();
+        assert_eq!(decoded, expected);
 
         // Test bit-pack encoding: 345345345455 (2 groups: 8 and 4)
         // 011 100 101 011 100 101 011 100 101 100 101 101

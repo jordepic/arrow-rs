@@ -182,6 +182,29 @@ pub trait Decoder<T: DataType>: Send {
     /// `buffer.len()`.
     fn get(&mut self, buffer: &mut [T::T]) -> Result<usize>;
 
+    /// Consumes values from this decoder and writes initialized results to
+    /// `buffer`.
+    ///
+    /// Implementations may override this to avoid initializing output that is
+    /// immediately overwritten. The default preserves the existing `get`
+    /// contract by initializing every slot first. Implementations for types
+    /// that require drop must leave every slot initialized if they return an
+    /// error.
+    fn get_uninit(&mut self, buffer: &mut [mem::MaybeUninit<T::T>]) -> Result<usize> {
+        for value in buffer.iter_mut() {
+            value.write(T::T::default());
+        }
+
+        // SAFETY: every element was initialized immediately above.
+        let initialized = unsafe {
+            std::slice::from_raw_parts_mut(
+                buffer.as_mut_ptr().cast::<T::T>(),
+                buffer.len(),
+            )
+        };
+        self.get(initialized)
+    }
+
     /// Consume values from this decoder and write the results to `buffer`, leaving
     /// "spaces" for null values.
     ///
@@ -406,6 +429,29 @@ impl<T: DataType> Decoder<T> for DictDecoder<T> {
         let rle = self.rle_decoder.as_mut().unwrap();
         let num_values = cmp::min(buffer.len(), self.num_values);
         rle.get_batch_with_dict(&self.dictionary[..], buffer, num_values)
+    }
+
+    fn get_uninit(&mut self, buffer: &mut [mem::MaybeUninit<T::T>]) -> Result<usize> {
+        assert!(self.rle_decoder.is_some());
+        assert!(self.has_dictionary, "Must call set_dict() first!");
+
+        if mem::needs_drop::<T::T>() {
+            for value in buffer.iter_mut() {
+                value.write(T::T::default());
+            }
+            // SAFETY: every element was initialized immediately above.
+            let initialized = unsafe {
+                std::slice::from_raw_parts_mut(
+                    buffer.as_mut_ptr().cast::<T::T>(),
+                    buffer.len(),
+                )
+            };
+            return self.get(initialized);
+        }
+
+        let rle = self.rle_decoder.as_mut().unwrap();
+        let num_values = cmp::min(buffer.len(), self.num_values);
+        rle.get_batch_with_dict_uninit(&self.dictionary[..], buffer, num_values)
     }
 
     /// Number of values left in this decoder stream
