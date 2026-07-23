@@ -37,13 +37,13 @@ ring = { version = "0.17", default-features = false, features = ["wasm32_unknown
 ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
 
 [dependencies]
-arrow-array = { workspace = true, optional = true }
-arrow-buffer = { workspace = true, optional = true }
-arrow-csv = { workspace = true, optional = true }
-arrow-data = { workspace = true, optional = true }
-arrow-schema = { workspace = true, optional = true }
-arrow-select = { workspace = true, optional = true }
-arrow-ipc = { workspace = true, optional = true }
+arrow-array = { version = "=58.3.0", optional = true }
+arrow-buffer = { version = "=58.3.0", optional = true }
+arrow-csv = { version = "=58.3.0", optional = true }
+arrow-data = { version = "=58.3.0", optional = true }
+arrow-schema = { version = "=58.3.0", optional = true }
+arrow-select = { version = "=58.3.0", optional = true }
+arrow-ipc = { version = "=58.3.0", optional = true }
 parquet-geospatial = { workspace = true, optional = true }
 parquet-variant = { workspace = true, optional = true }
 parquet-variant-json = { workspace = true, optional = true }
