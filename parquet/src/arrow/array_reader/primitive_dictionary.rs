@@ -49,13 +49,15 @@ impl ValuesBuffer for PrimitivePredicateBuffer {
 
     fn pad_nulls(
         &mut self,
-        read_offset: usize,
-        values_read: usize,
-        levels_read: usize,
-        valid_mask: &[u8],
+        _read_offset: usize,
+        _values_read: usize,
+        _levels_read: usize,
+        _valid_mask: &[u8],
     ) {
-        self.0
-            .pad_nulls(read_offset, values_read, levels_read, valid_mask)
+        // Keep predicate results compact. PrimitivePredicateReader combines
+        // them with the packed definition-level mask while constructing the
+        // final BooleanBuffer, avoiding an intermediate byte-per-row padded
+        // buffer and a second pass to bit-pack it.
     }
 }
 
@@ -589,15 +591,41 @@ where
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
+        let num_values = self.record_reader.num_values();
         self.def_levels_buffer = self.record_reader.consume_def_levels();
         self.rep_levels_buffer = self.record_reader.consume_rep_levels();
-        // The predicate result treats SQL null as false, but the record reader's
-        // packed definition-level buffer must still be consumed and reset between
-        // batches.
-        let _ = self.record_reader.consume_bitmap_buffer();
+        let validity = self
+            .record_reader
+            .consume_bitmap_buffer()
+            .map(|buffer| BooleanBuffer::new(buffer, 0, num_values));
+        let compact_values = self.record_reader.consume_record_data().0;
 
-        let values = self.record_reader.consume_record_data().0;
-        let values = BooleanBuffer::collect_bool(values.len(), |index| values[index] != 0);
+        let expected_values = validity
+            .as_ref()
+            .map(BooleanBuffer::count_set_bits)
+            .unwrap_or(num_values);
+        if compact_values.len() != expected_values {
+            return Err(general_err!(
+                "primitive predicate decoded {} values, expected {} for {} levels",
+                compact_values.len(),
+                expected_values,
+                num_values
+            ));
+        }
+
+        let mut compact_index = 0;
+        let values = BooleanBuffer::collect_bool(num_values, |index| {
+            if validity
+                .as_ref()
+                .is_none_or(|validity| validity.value(index))
+            {
+                let value = compact_values[compact_index] != 0;
+                compact_index += 1;
+                value
+            } else {
+                false
+            }
+        });
         self.record_reader.reset();
         Ok(Arc::new(BooleanArray::new(values, None)))
     }
