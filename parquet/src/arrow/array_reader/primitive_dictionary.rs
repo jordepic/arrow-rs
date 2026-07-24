@@ -591,6 +591,10 @@ where
     fn consume_batch(&mut self) -> Result<ArrayRef> {
         self.def_levels_buffer = self.record_reader.consume_def_levels();
         self.rep_levels_buffer = self.record_reader.consume_rep_levels();
+        // The predicate result treats SQL null as false, but the record reader's
+        // packed definition-level buffer must still be consumed and reset between
+        // batches.
+        let _ = self.record_reader.consume_bitmap_buffer();
 
         let values = self.record_reader.consume_record_data().0;
         let values = BooleanBuffer::collect_bool(values.len(), |index| values[index] != 0);
@@ -769,18 +773,24 @@ mod tests {
             dictionary_predicate: Arc::clone(&dictionary_predicate),
         })]);
         let output: Vec<RecordBatch> = builder
+            .with_batch_size(2)
             .with_row_filter(filter)
             .build()
             .unwrap()
             .collect::<std::result::Result<Vec<_>, ArrowError>>()
             .unwrap();
 
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].schema(), schema);
-        assert_eq!(
-            output[0].column(0).as_primitive::<arrow_array::types::Int64Type>(),
-            &Int64Array::from(vec![2, 2])
-        );
+        assert!(output.iter().all(|batch| batch.schema() == schema));
+        let values = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![Some(2), Some(2)]);
 
         dictionary_predicate.evaluations.load(Ordering::Relaxed)
     }
@@ -792,6 +802,6 @@ mod tests {
 
     #[test]
     fn evaluates_plain_primitive_values_for_predicate() {
-        assert_eq!(run_primitive_predicate(false), 1);
+        assert_eq!(run_primitive_predicate(false), 3);
     }
 }
