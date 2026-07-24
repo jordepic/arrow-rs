@@ -32,6 +32,7 @@ use crate::arrow::array_reader::{
     ArrayReader, FixedSizeListArrayReader, ListArrayReader, ListViewArrayReader, MapArrayReader,
     NullArrayReader, PrimitiveArrayReader, RowGroups, StructArrayReader,
     make_byte_array_dictionary_reader, make_byte_array_reader,
+    make_primitive_dictionary_reader,
 };
 use crate::arrow::arrow_reader::DEFAULT_BATCH_SIZE;
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
@@ -99,6 +100,7 @@ pub struct ArrayReaderBuilder<'a> {
     metrics: &'a ArrowReaderMetrics,
     /// Batch size for pre-allocating internal buffers
     batch_size: usize,
+    preserve_primitive_dictionaries: bool,
 }
 
 impl<'a> ArrayReaderBuilder<'a> {
@@ -110,6 +112,7 @@ impl<'a> ArrayReaderBuilder<'a> {
             parquet_metadata: None,
             metrics,
             batch_size: DEFAULT_BATCH_SIZE,
+            preserve_primitive_dictionaries: false,
         }
     }
 
@@ -118,6 +121,15 @@ impl<'a> ArrayReaderBuilder<'a> {
     /// This avoids reallocations when reading the first batch of data.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Preserve dictionary encoding for primitive leaf columns.
+    ///
+    /// This is useful for selective predicates that can evaluate dictionary
+    /// values once and remap the result through the encoded keys.
+    pub fn with_preserve_primitive_dictionaries(mut self, preserve: bool) -> Self {
+        self.preserve_primitive_dictionaries = preserve;
         self
     }
 
@@ -420,7 +432,22 @@ impl<'a> ArrayReaderBuilder<'a> {
         ));
 
         let page_iterator = self.row_groups.column_chunks(col_idx)?;
-        let arrow_type = Some(field.arrow_type.clone());
+        let arrow_type = Some(if self.preserve_primitive_dictionaries
+            && matches!(
+                physical_type,
+                PhysicalType::INT32
+                    | PhysicalType::INT64
+                    | PhysicalType::FLOAT
+                    | PhysicalType::DOUBLE
+            )
+        {
+            DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(field.arrow_type.clone()),
+            )
+        } else {
+            field.arrow_type.clone()
+        });
 
         // LogicalType::Unknown maps to DataType::Null. In the past it has been assumed
         // that only INT32 can have this annotation, but this is not required by the Parquet
@@ -443,17 +470,27 @@ impl<'a> ArrayReaderBuilder<'a> {
                 arrow_type,
                 self.batch_size,
             )?) as _,
+            PhysicalType::INT32 if self.preserve_primitive_dictionaries => {
+                make_primitive_dictionary_reader::<Int32Type>(
+                    page_iterator,
+                    column_desc,
+                    arrow_type.unwrap(),
+                    self.batch_size,
+                )?
+            }
             PhysicalType::INT32 => Box::new(PrimitiveArrayReader::<Int32Type>::new(
-                page_iterator,
-                column_desc,
-                arrow_type,
-                self.batch_size,
+                page_iterator, column_desc, arrow_type, self.batch_size,
             )?) as _,
+            PhysicalType::INT64 if self.preserve_primitive_dictionaries => {
+                make_primitive_dictionary_reader::<Int64Type>(
+                    page_iterator,
+                    column_desc,
+                    arrow_type.unwrap(),
+                    self.batch_size,
+                )?
+            }
             PhysicalType::INT64 => Box::new(PrimitiveArrayReader::<Int64Type>::new(
-                page_iterator,
-                column_desc,
-                arrow_type,
-                self.batch_size,
+                page_iterator, column_desc, arrow_type, self.batch_size,
             )?) as _,
             PhysicalType::INT96 => Box::new(PrimitiveArrayReader::<Int96Type>::new(
                 page_iterator,
@@ -461,17 +498,27 @@ impl<'a> ArrayReaderBuilder<'a> {
                 arrow_type,
                 self.batch_size,
             )?) as _,
+            PhysicalType::FLOAT if self.preserve_primitive_dictionaries => {
+                make_primitive_dictionary_reader::<FloatType>(
+                    page_iterator,
+                    column_desc,
+                    arrow_type.unwrap(),
+                    self.batch_size,
+                )?
+            }
             PhysicalType::FLOAT => Box::new(PrimitiveArrayReader::<FloatType>::new(
-                page_iterator,
-                column_desc,
-                arrow_type,
-                self.batch_size,
+                page_iterator, column_desc, arrow_type, self.batch_size,
             )?) as _,
+            PhysicalType::DOUBLE if self.preserve_primitive_dictionaries => {
+                make_primitive_dictionary_reader::<DoubleType>(
+                    page_iterator,
+                    column_desc,
+                    arrow_type.unwrap(),
+                    self.batch_size,
+                )?
+            }
             PhysicalType::DOUBLE => Box::new(PrimitiveArrayReader::<DoubleType>::new(
-                page_iterator,
-                column_desc,
-                arrow_type,
-                self.batch_size,
+                page_iterator, column_desc, arrow_type, self.batch_size,
             )?) as _,
             PhysicalType::BYTE_ARRAY => match arrow_type {
                 Some(DataType::Dictionary(_, _)) => make_byte_array_dictionary_reader(

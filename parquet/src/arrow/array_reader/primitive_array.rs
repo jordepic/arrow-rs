@@ -153,22 +153,51 @@ where
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
-        let target_type = &self.data_type;
-
-        // Convert physical data to equivalent arrow type, and then perform
-        // coercion as needed
-        let record_data = self
-            .record_reader
-            .consume_record_data()
-            .into_buffer(target_type);
-
         let len = self.record_reader.num_values();
         let nulls = self
             .record_reader
             .consume_bitmap_buffer()
             .and_then(|b| NullBuffer::from_unsliced_buffer(b, len));
 
-        let array: ArrayRef = match T::get_physical_type() {
+        let array = primitive_array_from_values::<T>(
+            self.record_reader.consume_record_data(),
+            &self.data_type,
+            nulls,
+        )?;
+
+        // save definition and repetition buffers
+        self.def_levels_buffer = self.record_reader.consume_def_levels();
+        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
+        self.record_reader.reset();
+        Ok(array)
+    }
+
+    fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+        skip_records(&mut self.record_reader, self.pages.as_mut(), num_records)
+    }
+
+    fn get_def_levels(&self) -> Option<&[i16]> {
+        self.def_levels_buffer.as_deref()
+    }
+
+    fn get_rep_levels(&self) -> Option<&[i16]> {
+        self.rep_levels_buffer.as_deref()
+    }
+}
+
+pub(crate) fn primitive_array_from_values<T>(
+    values: Vec<T::T>,
+    target_type: &ArrowType,
+    nulls: Option<NullBuffer>,
+) -> Result<ArrayRef>
+where
+    T: DataType,
+    T::T: Copy + Default,
+    Vec<T::T>: IntoBuffer,
+{
+    let len = values.len();
+    let record_data = values.into_buffer(target_type);
+    let array: ArrayRef = match T::get_physical_type() {
             PhysicalType::BOOLEAN => Arc::new(BooleanArray::new(
                 BooleanBuffer::new(record_data, 0, len),
                 nulls,
@@ -198,27 +227,7 @@ where
             }
         };
 
-        // Coerce the arrow type to the desired array type
-        let array = coerce_array(array, target_type)?;
-
-        // save definition and repetition buffers
-        self.def_levels_buffer = self.record_reader.consume_def_levels();
-        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
-        self.record_reader.reset();
-        Ok(array)
-    }
-
-    fn skip_records(&mut self, num_records: usize) -> Result<usize> {
-        skip_records(&mut self.record_reader, self.pages.as_mut(), num_records)
-    }
-
-    fn get_def_levels(&self) -> Option<&[i16]> {
-        self.def_levels_buffer.as_deref()
-    }
-
-    fn get_rep_levels(&self) -> Option<&[i16]> {
-        self.rep_levels_buffer.as_deref()
-    }
+    coerce_array(array, target_type)
 }
 
 /// Coerce the parquet physical type array to the target type
@@ -420,7 +429,7 @@ macro_rules! pack_dictionary_helper {
     };
 }
 
-fn pack_dictionary(key: &ArrowType, values: &dyn Array) -> Result<ArrayRef> {
+pub(crate) fn pack_dictionary(key: &ArrowType, values: &dyn Array) -> Result<ArrayRef> {
     downcast_integer! {
         key => (pack_dictionary_helper, values),
         _ => unreachable!("Invalid key type"),

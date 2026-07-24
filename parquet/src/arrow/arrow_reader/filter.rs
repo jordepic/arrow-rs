@@ -36,6 +36,15 @@ pub trait ArrowPredicate: Send + 'static {
     /// decoded again after a predicate is applied.
     fn projection(&self) -> &ProjectionMask;
 
+    /// Whether primitive dictionary encoding should be preserved while
+    /// decoding this predicate's projected columns.
+    ///
+    /// Implementations should only return `true` when they can evaluate
+    /// dictionary arrays with the same logical value type.
+    fn preserve_primitive_dictionaries(&self) -> bool {
+        false
+    }
+
     /// Evaluate this predicate for the given [`RecordBatch`] containing the columns
     /// identified by [`Self::projection`]
     ///

@@ -43,6 +43,7 @@ mod list_view_array;
 mod map_array;
 mod null_array;
 mod primitive_array;
+mod primitive_dictionary;
 mod row_group_cache;
 mod row_group_index;
 mod row_number;
@@ -66,6 +67,7 @@ pub use list_view_array::ListViewArrayReader;
 pub use map_array::MapArrayReader;
 pub use null_array::NullArrayReader;
 pub use primitive_array::PrimitiveArrayReader;
+pub use primitive_dictionary::make_primitive_dictionary_reader;
 pub use row_group_cache::RowGroupCache;
 pub use struct_array::StructArrayReader;
 

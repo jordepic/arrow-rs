@@ -455,6 +455,9 @@ impl RowGroupReaderBuilder {
                     .with_batch_size(self.batch_size)
                     .with_cache_options(Some(&cache_options))
                     .with_parquet_metadata(&self.metadata)
+                    .with_preserve_primitive_dictionaries(
+                        predicate.preserve_primitive_dictionaries(),
+                    )
                     .build_array_reader(self.fields.as_deref(), predicate.projection())?;
 
                 // Reset to original policy before each predicate so the override

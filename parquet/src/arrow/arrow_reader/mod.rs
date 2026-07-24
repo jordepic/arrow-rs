@@ -1222,6 +1222,9 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
                 let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
                     .with_batch_size(batch_size)
                     .with_parquet_metadata(&reader.metadata)
+                    .with_preserve_primitive_dictionaries(
+                        predicate.preserve_primitive_dictionaries(),
+                    )
                     .build_array_reader(fields.as_deref(), predicate.projection())?;
 
                 plan_builder = plan_builder.with_predicate(array_reader, predicate.as_mut())?;
