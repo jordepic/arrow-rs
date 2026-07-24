@@ -27,7 +27,9 @@ use bytes::Bytes;
 use crate::arrow::array_reader::primitive_array::{
     IntoBuffer, primitive_array_from_values,
 };
-use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use crate::arrow::array_reader::{
+    ArrayReader, PrimitiveArrayReader, read_records, skip_records,
+};
 use crate::arrow::arrow_reader::PrimitiveDictionaryPredicate;
 use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::record_reader::buffer::ValuesBuffer;
@@ -665,7 +667,7 @@ where
     }
 }
 
-pub fn make_primitive_predicate_reader<T>(
+fn make_direct_primitive_predicate_reader<T>(
     pages: Box<dyn PageIterator>,
     column_desc: ColumnDescPtr,
     value_type: ArrowType,
@@ -696,6 +698,121 @@ where
             batch_size,
             decoder_factory,
         ),
+        _marker: PhantomData,
+    }))
+}
+
+struct AdaptivePrimitivePredicateReader<T>
+where
+    T: DataType,
+    T::T: Copy + Default + Send + Sync,
+    Vec<T::T>: IntoBuffer,
+{
+    pages: Option<Box<dyn PageIterator>>,
+    column_desc: ColumnDescPtr,
+    value_type: ArrowType,
+    batch_size: usize,
+    predicate: Arc<dyn PrimitiveDictionaryPredicate>,
+    reader: Option<Box<dyn ArrayReader>>,
+    precomputed: bool,
+    _marker: PhantomData<T>,
+}
+
+impl<T> AdaptivePrimitivePredicateReader<T>
+where
+    T: DataType,
+    T::T: Copy + Default + Send + Sync,
+    Vec<T::T>: IntoBuffer,
+{
+    fn ensure_reader(&mut self) -> Result<&mut Box<dyn ArrayReader>> {
+        if self.reader.is_none() {
+            let pages = self.pages.take().expect("reader initialized once");
+            self.precomputed = self.predicate.can_evaluate_dictionary();
+            self.reader = Some(if self.precomputed {
+                make_direct_primitive_predicate_reader::<T>(
+                    pages,
+                    Arc::clone(&self.column_desc),
+                    self.value_type.clone(),
+                    self.batch_size,
+                    Arc::clone(&self.predicate),
+                )?
+            } else {
+                Box::new(PrimitiveArrayReader::<T>::new(
+                    pages,
+                    Arc::clone(&self.column_desc),
+                    Some(self.value_type.clone()),
+                    self.batch_size,
+                )?)
+            });
+        }
+        Ok(self.reader.as_mut().expect("reader initialized"))
+    }
+}
+
+impl<T> ArrayReader for AdaptivePrimitivePredicateReader<T>
+where
+    T: DataType,
+    T::T: Copy + Default + Send + Sync,
+    Vec<T::T>: IntoBuffer,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn get_data_type(&self) -> &ArrowType {
+        &ArrowType::Boolean
+    }
+
+    fn is_predicate_result(&self) -> bool {
+        true
+    }
+
+    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+        self.ensure_reader()?.read_records(batch_size)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        let values = self.ensure_reader()?.consume_batch()?;
+        if self.precomputed {
+            Ok(values)
+        } else {
+            Ok(Arc::new(self.predicate.evaluate(values)?))
+        }
+    }
+
+    fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+        self.ensure_reader()?.skip_records(num_records)
+    }
+
+    fn get_def_levels(&self) -> Option<&[i16]> {
+        self.reader.as_ref().and_then(|reader| reader.get_def_levels())
+    }
+
+    fn get_rep_levels(&self) -> Option<&[i16]> {
+        self.reader.as_ref().and_then(|reader| reader.get_rep_levels())
+    }
+}
+
+pub fn make_primitive_predicate_reader<T>(
+    pages: Box<dyn PageIterator>,
+    column_desc: ColumnDescPtr,
+    value_type: ArrowType,
+    batch_size: usize,
+    predicate: Arc<dyn PrimitiveDictionaryPredicate>,
+) -> Result<Box<dyn ArrayReader>>
+where
+    T: DataType,
+    T::T: Copy + Default + Send + Sync,
+    Vec<T::T>: IntoBuffer,
+{
+    Ok(Box::new(AdaptivePrimitivePredicateReader::<T> {
+        pages: Some(pages),
+        column_desc,
+        value_type,
+        batch_size,
+        predicate,
+        reader: None,
+        precomputed: false,
         _marker: PhantomData,
     }))
 }
@@ -750,9 +867,14 @@ mod tests {
     #[derive(Debug)]
     struct EqualsTwoDictionaryPredicate {
         evaluations: AtomicUsize,
+        evaluate_dictionary: bool,
     }
 
     impl PrimitiveDictionaryPredicate for EqualsTwoDictionaryPredicate {
+        fn can_evaluate_dictionary(&self) -> bool {
+            self.evaluate_dictionary
+        }
+
         fn evaluate(
             &self,
             values: ArrayRef,
@@ -789,7 +911,10 @@ mod tests {
         }
     }
 
-    fn run_primitive_predicate(dictionary_enabled: bool) -> usize {
+    fn run_primitive_predicate(
+        dictionary_enabled: bool,
+        evaluate_dictionary: bool,
+    ) -> usize {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             ArrowType::Int64,
@@ -817,6 +942,7 @@ mod tests {
         let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
         let dictionary_predicate = Arc::new(EqualsTwoDictionaryPredicate {
             evaluations: AtomicUsize::new(0),
+            evaluate_dictionary,
         });
         let filter = RowFilter::new(vec![Box::new(DictionaryPredicate {
             projection,
@@ -847,11 +973,16 @@ mod tests {
 
     #[test]
     fn evaluates_primitive_dictionary_once_for_predicate() {
-        assert_eq!(run_primitive_predicate(true), 1);
+        assert_eq!(run_primitive_predicate(true, true), 1);
+    }
+
+    #[test]
+    fn falls_back_to_batch_evaluation_for_ineligible_dictionary_predicate() {
+        assert_eq!(run_primitive_predicate(true, false), 4);
     }
 
     #[test]
     fn evaluates_plain_primitive_values_for_predicate() {
-        assert_eq!(run_primitive_predicate(false), 3);
+        assert_eq!(run_primitive_predicate(false, true), 3);
     }
 }

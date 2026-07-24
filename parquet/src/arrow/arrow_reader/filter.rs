@@ -27,6 +27,13 @@ use std::sync::Arc;
 /// The Parquet reader can use the resulting Boolean mask while decoding
 /// dictionary IDs, avoiding expansion of values that the predicate rejects.
 pub trait PrimitiveDictionaryPredicate: Debug + Send + Sync + 'static {
+    /// Whether the predicate's current shape benefits from evaluation against
+    /// dictionary values. This is checked when reading begins so dynamic
+    /// predicates can be updated after the reader is planned.
+    fn can_evaluate_dictionary(&self) -> bool {
+        true
+    }
+
     /// Evaluate this predicate against the dictionary values.
     fn evaluate(&self, values: ArrayRef) -> Result<BooleanArray, ArrowError>;
 }
