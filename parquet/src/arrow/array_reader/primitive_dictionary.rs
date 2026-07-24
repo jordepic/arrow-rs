@@ -20,7 +20,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray, DictionaryArray, Int32Array, new_empty_array};
-use arrow_buffer::{BooleanBuffer, NullBuffer};
+use arrow_buffer::{BooleanBuffer, MutableBuffer, NullBuffer};
 use arrow_schema::DataType as ArrowType;
 use bytes::Bytes;
 
@@ -614,18 +614,40 @@ where
         }
 
         let mut compact_index = 0;
-        let values = BooleanBuffer::collect_bool(num_values, |index| {
-            if validity
+        let mut output = MutableBuffer::new_null(num_values);
+        for (byte_index, output_byte) in output.as_slice_mut().iter_mut().enumerate() {
+            let remaining = num_values - byte_index * 8;
+            let relevant_bits = remaining.min(8);
+            let mut valid_byte = validity
                 .as_ref()
-                .is_none_or(|validity| validity.value(index))
-            {
-                let value = compact_values[compact_index] != 0;
-                compact_index += 1;
-                value
-            } else {
-                false
+                .map(|validity| validity.values()[byte_index])
+                .unwrap_or(u8::MAX);
+            if relevant_bits != 8 {
+                valid_byte &= (1_u8 << relevant_bits) - 1;
             }
-        });
+
+            if valid_byte == u8::MAX {
+                let values = &compact_values[compact_index..compact_index + 8];
+                *output_byte = values[0]
+                    | values[1] << 1
+                    | values[2] << 2
+                    | values[3] << 3
+                    | values[4] << 4
+                    | values[5] << 5
+                    | values[6] << 6
+                    | values[7] << 7;
+                compact_index += 8;
+                continue;
+            }
+
+            while valid_byte != 0 {
+                let bit = valid_byte.trailing_zeros();
+                *output_byte |= compact_values[compact_index] << bit;
+                compact_index += 1;
+                valid_byte &= valid_byte - 1;
+            }
+        }
+        let values = BooleanBuffer::new(output.into(), 0, num_values);
         self.record_reader.reset();
         Ok(Arc::new(BooleanArray::new(values, None)))
     }
