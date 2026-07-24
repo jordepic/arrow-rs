@@ -686,11 +686,23 @@ impl RowGroupReaderBuilder {
         if self.max_predicate_cache_size == 0 {
             return None;
         }
+        let schema = self.metadata.file_metadata().schema_descr();
         let mut cache_projection = filter.predicates.first()?.projection().clone();
+        let mut dictionary_projection = ProjectionMask::none(schema.num_columns());
         for predicate in filter.predicates.iter() {
             cache_projection.union(predicate.projection());
+            if predicate.preserve_primitive_dictionaries() {
+                dictionary_projection.union(predicate.projection());
+            }
         }
         cache_projection.intersect(&self.projection);
+        cache_projection = ProjectionMask::leaves(
+            schema,
+            (0..schema.num_columns()).filter(|index| {
+                cache_projection.leaf_included(*index)
+                    && !dictionary_projection.leaf_included(*index)
+            }),
+        );
         self.exclude_nested_columns_from_cache(&cache_projection)
     }
 
