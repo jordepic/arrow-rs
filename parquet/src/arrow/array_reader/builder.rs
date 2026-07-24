@@ -32,9 +32,9 @@ use crate::arrow::array_reader::{
     ArrayReader, FixedSizeListArrayReader, ListArrayReader, ListViewArrayReader, MapArrayReader,
     NullArrayReader, PrimitiveArrayReader, RowGroups, StructArrayReader,
     make_byte_array_dictionary_reader, make_byte_array_reader,
-    make_primitive_dictionary_reader,
+    make_primitive_dictionary_reader, make_primitive_predicate_reader,
 };
-use crate::arrow::arrow_reader::DEFAULT_BATCH_SIZE;
+use crate::arrow::arrow_reader::{DEFAULT_BATCH_SIZE, PrimitiveDictionaryPredicate};
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::schema::{ParquetField, ParquetFieldType, VirtualColumnType};
 use crate::basic::Type as PhysicalType;
@@ -101,6 +101,7 @@ pub struct ArrayReaderBuilder<'a> {
     /// Batch size for pre-allocating internal buffers
     batch_size: usize,
     preserve_primitive_dictionaries: bool,
+    primitive_dictionary_predicate: Option<Arc<dyn PrimitiveDictionaryPredicate>>,
 }
 
 impl<'a> ArrayReaderBuilder<'a> {
@@ -113,6 +114,7 @@ impl<'a> ArrayReaderBuilder<'a> {
             metrics,
             batch_size: DEFAULT_BATCH_SIZE,
             preserve_primitive_dictionaries: false,
+            primitive_dictionary_predicate: None,
         }
     }
 
@@ -130,6 +132,16 @@ impl<'a> ArrayReaderBuilder<'a> {
     /// values once and remap the result through the encoded keys.
     pub fn with_preserve_primitive_dictionaries(mut self, preserve: bool) -> Self {
         self.preserve_primitive_dictionaries = preserve;
+        self
+    }
+
+    /// Evaluate a single primitive predicate directly while decoding Parquet
+    /// dictionary IDs.
+    pub fn with_primitive_dictionary_predicate(
+        mut self,
+        predicate: Option<Arc<dyn PrimitiveDictionaryPredicate>>,
+    ) -> Self {
+        self.primitive_dictionary_predicate = predicate;
         self
     }
 
@@ -460,6 +472,46 @@ impl<'a> ArrayReaderBuilder<'a> {
                 column_desc,
                 self.batch_size,
             )?) as _;
+            return Ok(Some(reader));
+        }
+
+        if let Some(predicate) = &self.primitive_dictionary_predicate {
+            let reader = match physical_type {
+                PhysicalType::INT32 => make_primitive_predicate_reader::<Int32Type>(
+                    page_iterator,
+                    column_desc,
+                    field.arrow_type.clone(),
+                    self.batch_size,
+                    Arc::clone(predicate),
+                )?,
+                PhysicalType::INT64 => make_primitive_predicate_reader::<Int64Type>(
+                    page_iterator,
+                    column_desc,
+                    field.arrow_type.clone(),
+                    self.batch_size,
+                    Arc::clone(predicate),
+                )?,
+                PhysicalType::FLOAT => make_primitive_predicate_reader::<FloatType>(
+                    page_iterator,
+                    column_desc,
+                    field.arrow_type.clone(),
+                    self.batch_size,
+                    Arc::clone(predicate),
+                )?,
+                PhysicalType::DOUBLE => make_primitive_predicate_reader::<DoubleType>(
+                    page_iterator,
+                    column_desc,
+                    field.arrow_type.clone(),
+                    self.batch_size,
+                    Arc::clone(predicate),
+                )?,
+                _ => {
+                    return Err(general_err!(
+                        "primitive dictionary predicate does not support {}",
+                        physical_type
+                    ));
+                }
+            };
             return Ok(Some(reader));
         }
 

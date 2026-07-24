@@ -19,8 +19,8 @@ use std::any::Any;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, DictionaryArray, Int32Array, new_empty_array};
-use arrow_buffer::NullBuffer;
+use arrow_array::{ArrayRef, BooleanArray, DictionaryArray, Int32Array, new_empty_array};
+use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::DataType as ArrowType;
 use bytes::Bytes;
 
@@ -28,6 +28,7 @@ use crate::arrow::array_reader::primitive_array::{
     IntoBuffer, primitive_array_from_values,
 };
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use crate::arrow::arrow_reader::PrimitiveDictionaryPredicate;
 use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::record_reader::buffer::ValuesBuffer;
 use crate::basic::Encoding;
@@ -38,6 +39,223 @@ use crate::encodings::decoding::{Decoder, PlainDecoder};
 use crate::encodings::rle::RleDecoder;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
+
+struct PrimitivePredicateBuffer(Vec<u8>);
+
+impl ValuesBuffer for PrimitivePredicateBuffer {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    fn pad_nulls(
+        &mut self,
+        read_offset: usize,
+        values_read: usize,
+        levels_read: usize,
+        valid_mask: &[u8],
+    ) {
+        self.0
+            .pad_nulls(read_offset, values_read, levels_read, valid_mask)
+    }
+}
+
+enum PrimitivePredicateValueDecoder<T: DataType> {
+    Dict {
+        decoder: RleDecoder,
+        max_remaining_values: usize,
+    },
+    Fallback(ColumnValueDecoderImpl<T>),
+}
+
+struct PrimitivePredicateDecoder<T: DataType> {
+    column_desc: ColumnDescPtr,
+    value_type: ArrowType,
+    predicate: Arc<dyn PrimitiveDictionaryPredicate>,
+    dictionary_filter: Option<Vec<u8>>,
+    decoder: Option<PrimitivePredicateValueDecoder<T>>,
+}
+
+impl<T> PrimitivePredicateDecoder<T>
+where
+    T: DataType,
+    T::T: Copy + Default + Send + Sync,
+    Vec<T::T>: IntoBuffer,
+{
+    fn with_predicate(
+        column_desc: ColumnDescPtr,
+        value_type: ArrowType,
+        predicate: Arc<dyn PrimitiveDictionaryPredicate>,
+    ) -> Self {
+        Self {
+            column_desc,
+            value_type,
+            predicate,
+            dictionary_filter: None,
+            decoder: None,
+        }
+    }
+
+    fn evaluate_values(&self, values: Vec<T::T>) -> Result<BooleanArray> {
+        let values =
+            primitive_array_from_values::<T>(values, &self.value_type, None)?;
+        Ok(self.predicate.evaluate(values)?)
+    }
+}
+
+impl<T> ColumnValueDecoder for PrimitivePredicateDecoder<T>
+where
+    T: DataType,
+    T::T: Copy + Default + Send + Sync,
+    Vec<T::T>: IntoBuffer,
+{
+    type Buffer = PrimitivePredicateBuffer;
+
+    fn new(column_desc: &ColumnDescPtr) -> Self {
+        Self {
+            column_desc: Arc::clone(column_desc),
+            value_type: ArrowType::Null,
+            predicate: Arc::new(UnconfiguredPrimitivePredicate),
+            dictionary_filter: None,
+            decoder: None,
+        }
+    }
+
+    fn set_dict(
+        &mut self,
+        buf: Bytes,
+        num_values: u32,
+        encoding: Encoding,
+        _is_sorted: bool,
+    ) -> Result<()> {
+        if !matches!(
+            encoding,
+            Encoding::PLAIN | Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+        ) {
+            return Err(nyi_err!(
+                "Invalid/Unsupported encoding type for dictionary: {}",
+                encoding
+            ));
+        }
+
+        let mut decoder = PlainDecoder::<T>::new(self.column_desc.type_length());
+        decoder.set_data(buf, num_values as usize)?;
+        let mut values = vec![T::T::default(); num_values as usize];
+        let decoded = decoder.get(&mut values)?;
+        values.truncate(decoded);
+        let filter = self.evaluate_values(values)?;
+        if filter.len() != decoded {
+            return Err(general_err!(
+                "primitive dictionary predicate returned {} values, expected {}",
+                filter.len(),
+                decoded
+            ));
+        }
+        self.dictionary_filter = Some(
+            filter
+                .iter()
+                .map(|value| u8::from(value.unwrap_or(false)))
+                .collect(),
+        );
+        Ok(())
+    }
+
+    fn set_data(
+        &mut self,
+        encoding: Encoding,
+        data: Bytes,
+        num_levels: usize,
+        num_values: Option<usize>,
+    ) -> Result<()> {
+        self.decoder = Some(match encoding {
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                let bit_width = data[0];
+                let mut decoder = RleDecoder::new(bit_width);
+                decoder.set_data(data.slice(1..))?;
+                PrimitivePredicateValueDecoder::Dict {
+                    decoder,
+                    max_remaining_values: num_values.unwrap_or(num_levels),
+                }
+            }
+            _ => {
+                let mut decoder = ColumnValueDecoderImpl::<T>::new(&self.column_desc);
+                decoder.set_data(encoding, data, num_levels, num_values)?;
+                PrimitivePredicateValueDecoder::Fallback(decoder)
+            }
+        });
+        Ok(())
+    }
+
+    fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize> {
+        match self.decoder.as_mut().expect("decoder set") {
+            PrimitivePredicateValueDecoder::Dict {
+                decoder,
+                max_remaining_values,
+            } => {
+                let len = num_values.min(*max_remaining_values);
+                let filter = self
+                    .dictionary_filter
+                    .as_ref()
+                    .ok_or_else(|| general_err!("missing dictionary predicate mask"))?;
+                let offset = out.0.len();
+                out.0.resize(offset + len, 0);
+                let read =
+                    decoder.get_batch_with_dict(filter, &mut out.0[offset..], len)?;
+                out.0.truncate(offset + read);
+                *max_remaining_values -= read;
+                Ok(read)
+            }
+            PrimitivePredicateValueDecoder::Fallback(decoder) => {
+                let mut values = Vec::with_capacity(num_values);
+                let read = decoder.read(&mut values, num_values)?;
+                let filter = self.evaluate_values(values)?;
+                if filter.len() != read {
+                    return Err(general_err!(
+                        "primitive predicate returned {} values, expected {}",
+                        filter.len(),
+                        read
+                    ));
+                }
+                out.0.extend(
+                    filter
+                        .iter()
+                        .map(|value| u8::from(value.unwrap_or(false))),
+                );
+                Ok(read)
+            }
+        }
+    }
+
+    fn skip_values(&mut self, num_values: usize) -> Result<usize> {
+        match self.decoder.as_mut().expect("decoder set") {
+            PrimitivePredicateValueDecoder::Dict {
+                decoder,
+                max_remaining_values,
+            } => {
+                let len = num_values.min(*max_remaining_values);
+                let skipped = decoder.skip(len)?;
+                *max_remaining_values -= skipped;
+                Ok(skipped)
+            }
+            PrimitivePredicateValueDecoder::Fallback(decoder) => {
+                decoder.skip_values(num_values)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UnconfiguredPrimitivePredicate;
+
+impl PrimitiveDictionaryPredicate for UnconfiguredPrimitivePredicate {
+    fn evaluate(
+        &self,
+        _values: ArrayRef,
+    ) -> std::result::Result<BooleanArray, arrow_schema::ArrowError> {
+        Err(arrow_schema::ArrowError::ComputeError(
+            "primitive predicate decoder was not configured".to_string(),
+        ))
+    }
+}
 
 enum PrimitiveDictionaryBuffer<T: DataType> {
     Dict {
@@ -334,6 +552,100 @@ where
     }
 }
 
+struct PrimitivePredicateReader<T>
+where
+    T: DataType,
+    T::T: Copy + Default + Send + Sync,
+    Vec<T::T>: IntoBuffer,
+{
+    pages: Box<dyn PageIterator>,
+    def_levels_buffer: Option<Vec<i16>>,
+    rep_levels_buffer: Option<Vec<i16>>,
+    record_reader:
+        GenericRecordReader<PrimitivePredicateBuffer, PrimitivePredicateDecoder<T>>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> ArrayReader for PrimitivePredicateReader<T>
+where
+    T: DataType,
+    T::T: Copy + Default + Send + Sync,
+    Vec<T::T>: IntoBuffer,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn get_data_type(&self) -> &ArrowType {
+        &ArrowType::Boolean
+    }
+
+    fn is_predicate_result(&self) -> bool {
+        true
+    }
+
+    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+        read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        self.def_levels_buffer = self.record_reader.consume_def_levels();
+        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
+
+        let values = self.record_reader.consume_record_data().0;
+        let values = BooleanBuffer::collect_bool(values.len(), |index| values[index] != 0);
+        self.record_reader.reset();
+        Ok(Arc::new(BooleanArray::new(values, None)))
+    }
+
+    fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+        skip_records(&mut self.record_reader, self.pages.as_mut(), num_records)
+    }
+
+    fn get_def_levels(&self) -> Option<&[i16]> {
+        self.def_levels_buffer.as_deref()
+    }
+
+    fn get_rep_levels(&self) -> Option<&[i16]> {
+        self.rep_levels_buffer.as_deref()
+    }
+}
+
+pub fn make_primitive_predicate_reader<T>(
+    pages: Box<dyn PageIterator>,
+    column_desc: ColumnDescPtr,
+    value_type: ArrowType,
+    batch_size: usize,
+    predicate: Arc<dyn PrimitiveDictionaryPredicate>,
+) -> Result<Box<dyn ArrayReader>>
+where
+    T: DataType,
+    T::T: Copy + Default + Send + Sync,
+    Vec<T::T>: IntoBuffer,
+{
+    let factory_value_type = value_type.clone();
+    let factory_predicate = Arc::clone(&predicate);
+    let decoder_factory = Arc::new(move |column_desc: &ColumnDescPtr| {
+        PrimitivePredicateDecoder::<T>::with_predicate(
+            Arc::clone(column_desc),
+            factory_value_type.clone(),
+            Arc::clone(&factory_predicate),
+        )
+    });
+
+    Ok(Box::new(PrimitivePredicateReader::<T> {
+        pages,
+        def_levels_buffer: None,
+        rep_levels_buffer: None,
+        record_reader: GenericRecordReader::new_with_decoder_factory(
+            column_desc,
+            batch_size,
+            decoder_factory,
+        ),
+        _marker: PhantomData,
+    }))
+}
+
 pub fn make_primitive_dictionary_reader<T>(
     pages: Box<dyn PageIterator>,
     column_desc: ColumnDescPtr,
@@ -364,10 +676,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::compute::cast;
-    use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch};
+    use arrow_array::{BooleanArray, Int64Array, RecordBatch};
     use arrow_array::cast::AsArray;
     use arrow_schema::{ArrowError, Field, Schema};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::arrow::ArrowWriter;
     use crate::arrow::ProjectionMask;
@@ -378,6 +690,26 @@ mod tests {
 
     struct DictionaryPredicate {
         projection: ProjectionMask,
+        dictionary_predicate: Arc<EqualsTwoDictionaryPredicate>,
+    }
+
+    #[derive(Debug)]
+    struct EqualsTwoDictionaryPredicate {
+        evaluations: AtomicUsize,
+    }
+
+    impl PrimitiveDictionaryPredicate for EqualsTwoDictionaryPredicate {
+        fn evaluate(
+            &self,
+            values: ArrayRef,
+        ) -> std::result::Result<BooleanArray, ArrowError> {
+            self.evaluations.fetch_add(1, Ordering::Relaxed);
+            let values = values.as_primitive::<arrow_array::types::Int64Type>();
+            Ok(values
+                .iter()
+                .map(|value| value.map(|value| value == 2))
+                .collect())
+        }
     }
 
     impl ArrowPredicate for DictionaryPredicate {
@@ -389,21 +721,21 @@ mod tests {
             true
         }
 
+        fn primitive_dictionary_predicate(
+            &self,
+        ) -> Option<Arc<dyn PrimitiveDictionaryPredicate>> {
+            Some(self.dictionary_predicate.clone())
+        }
+
         fn evaluate(&mut self, batch: RecordBatch) -> std::result::Result<BooleanArray, ArrowError> {
-            assert!(matches!(
-                batch.column(0).data_type(),
-                ArrowType::Dictionary(key, value)
-                    if key.as_ref() == &ArrowType::Int32
-                        && value.as_ref() == &ArrowType::Int64
-            ));
-            let values = cast(batch.column(0), &ArrowType::Int64)?;
-            let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
-            Ok(values.iter().map(|value| value.map(|value| value == 2)).collect())
+            panic!(
+                "dictionary predicate should be precomputed, got {:?}",
+                batch.schema()
+            )
         }
     }
 
-    #[test]
-    fn preserves_primitive_dictionary_for_predicate_only() {
+    fn run_primitive_predicate(dictionary_enabled: bool) -> usize {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             ArrowType::Int64,
@@ -419,7 +751,7 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values]).unwrap();
         let properties = WriterProperties::builder()
-            .set_dictionary_enabled(true)
+            .set_dictionary_enabled(dictionary_enabled)
             .build();
         let mut parquet = Vec::new();
         let mut writer =
@@ -429,7 +761,13 @@ mod tests {
 
         let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parquet)).unwrap();
         let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
-        let filter = RowFilter::new(vec![Box::new(DictionaryPredicate { projection })]);
+        let dictionary_predicate = Arc::new(EqualsTwoDictionaryPredicate {
+            evaluations: AtomicUsize::new(0),
+        });
+        let filter = RowFilter::new(vec![Box::new(DictionaryPredicate {
+            projection,
+            dictionary_predicate: Arc::clone(&dictionary_predicate),
+        })]);
         let output: Vec<RecordBatch> = builder
             .with_row_filter(filter)
             .build()
@@ -443,5 +781,17 @@ mod tests {
             output[0].column(0).as_primitive::<arrow_array::types::Int64Type>(),
             &Int64Array::from(vec![2, 2])
         );
+
+        dictionary_predicate.evaluations.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn evaluates_primitive_dictionary_once_for_predicate() {
+        assert_eq!(run_primitive_predicate(true), 1);
+    }
+
+    #[test]
+    fn evaluates_plain_primitive_values_for_predicate() {
+        assert_eq!(run_primitive_predicate(false), 1);
     }
 }

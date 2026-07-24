@@ -440,6 +440,7 @@ impl RowGroupReaderBuilder {
                 } = row_group_info;
 
                 let predicate = filter_info.current();
+                let primitive_dictionary_predicate = predicate.primitive_dictionary_predicate();
 
                 let row_group = data_request.try_into_in_memory_row_group(
                     row_group_idx,
@@ -458,6 +459,7 @@ impl RowGroupReaderBuilder {
                     .with_preserve_primitive_dictionaries(
                         predicate.preserve_primitive_dictionaries(),
                     )
+                    .with_primitive_dictionary_predicate(primitive_dictionary_predicate)
                     .build_array_reader(self.fields.as_deref(), predicate.projection())?;
 
                 // Reset to original policy before each predicate so the override

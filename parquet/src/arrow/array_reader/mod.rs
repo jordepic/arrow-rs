@@ -67,7 +67,9 @@ pub use list_view_array::ListViewArrayReader;
 pub use map_array::MapArrayReader;
 pub use null_array::NullArrayReader;
 pub use primitive_array::PrimitiveArrayReader;
-pub use primitive_dictionary::make_primitive_dictionary_reader;
+pub use primitive_dictionary::{
+    make_primitive_dictionary_reader, make_primitive_predicate_reader,
+};
 pub use row_group_cache::RowGroupCache;
 pub use struct_array::StructArrayReader;
 
@@ -95,6 +97,12 @@ pub trait ArrayReader: Send {
 
     /// Returns the arrow type of this array reader.
     fn get_data_type(&self) -> &ArrowType;
+
+    /// Returns true when this reader directly produces a Boolean predicate
+    /// result instead of the projected input values.
+    fn is_predicate_result(&self) -> bool {
+        false
+    }
 
     /// Reads at most `batch_size` records into an arrow array and return it.
     #[cfg(any(feature = "experimental", test))]

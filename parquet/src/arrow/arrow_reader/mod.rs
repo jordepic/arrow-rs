@@ -21,7 +21,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
-pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
+pub use filter::{ArrowPredicate, ArrowPredicateFn, PrimitiveDictionaryPredicate, RowFilter};
 pub use selection::{RowSelection, RowSelectionCursor, RowSelectionPolicy, RowSelector};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -1218,6 +1218,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
                 let mut cache_projection = predicate.projection().clone();
                 cache_projection.intersect(&projection);
+                let primitive_dictionary_predicate = predicate.primitive_dictionary_predicate();
 
                 let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
                     .with_batch_size(batch_size)
@@ -1225,6 +1226,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
                     .with_preserve_primitive_dictionaries(
                         predicate.preserve_primitive_dictionaries(),
                     )
+                    .with_primitive_dictionary_predicate(primitive_dictionary_predicate)
                     .build_array_reader(fields.as_deref(), predicate.projection())?;
 
                 plan_builder = plan_builder.with_predicate(array_reader, predicate.as_mut())?;

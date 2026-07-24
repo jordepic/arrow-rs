@@ -223,6 +223,7 @@ impl ReadPlanBuilder {
             None => limit.map(|_| total_rows),
         };
 
+        let predicate_result = array_reader.is_predicate_result();
         let reader = ParquetRecordBatchReader::new(array_reader, self.clone().build());
         let mut filters = vec![];
         let mut processed_rows: usize = 0;
@@ -230,7 +231,19 @@ impl ReadPlanBuilder {
         for maybe_batch in reader {
             let maybe_batch = maybe_batch?;
             let input_rows = maybe_batch.num_rows();
-            let filter = predicate.evaluate(maybe_batch)?;
+            let filter = if predicate_result {
+                let filter = maybe_batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        arrow_err!("precomputed Parquet predicate result was not Boolean")
+                    })?
+                    .clone();
+                predicate.evaluate_precomputed(filter)?
+            } else {
+                predicate.evaluate(maybe_batch)?
+            };
             // Since user supplied predicate, check error here to catch bugs quickly
             if filter.len() != input_rows {
                 return Err(arrow_err!(

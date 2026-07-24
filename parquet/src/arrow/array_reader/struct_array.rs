@@ -62,6 +62,10 @@ impl ArrayReader for StructArrayReader {
         &self.data_type
     }
 
+    fn is_predicate_result(&self) -> bool {
+        self.children.len() == 1 && self.children[0].is_predicate_result()
+    }
+
     fn read_records(&mut self, batch_size: usize) -> Result<usize> {
         let mut read = None;
         for child in self.children.iter_mut() {

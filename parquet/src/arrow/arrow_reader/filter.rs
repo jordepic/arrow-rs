@@ -16,9 +16,20 @@
 // under the License.
 
 use crate::arrow::ProjectionMask;
-use arrow_array::{BooleanArray, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+
+/// Evaluates a predicate once against the values of a primitive Parquet
+/// dictionary.
+///
+/// The Parquet reader can use the resulting Boolean mask while decoding
+/// dictionary IDs, avoiding expansion of values that the predicate rejects.
+pub trait PrimitiveDictionaryPredicate: Debug + Send + Sync + 'static {
+    /// Evaluate this predicate against the dictionary values.
+    fn evaluate(&self, values: ArrayRef) -> Result<BooleanArray, ArrowError>;
+}
 
 /// A predicate operating on [`RecordBatch`]
 ///
@@ -43,6 +54,18 @@ pub trait ArrowPredicate: Send + 'static {
     /// dictionary arrays with the same logical value type.
     fn preserve_primitive_dictionaries(&self) -> bool {
         false
+    }
+
+    /// Return an evaluator that can apply this predicate directly to primitive
+    /// Parquet dictionary values.
+    fn primitive_dictionary_predicate(&self) -> Option<Arc<dyn PrimitiveDictionaryPredicate>> {
+        None
+    }
+
+    /// Account for and return a predicate result already computed by the
+    /// Parquet decoder.
+    fn evaluate_precomputed(&mut self, filter: BooleanArray) -> Result<BooleanArray, ArrowError> {
+        Ok(filter)
     }
 
     /// Evaluate this predicate for the given [`RecordBatch`] containing the columns

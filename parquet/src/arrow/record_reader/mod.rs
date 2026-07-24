@@ -16,6 +16,7 @@
 // under the License.
 
 use arrow_buffer::Buffer;
+use std::sync::Arc;
 
 use crate::arrow::record_reader::{
     buffer::ValuesBuffer,
@@ -62,6 +63,7 @@ pub struct GenericRecordReader<V, CV> {
     num_records: usize,
     /// Capacity hint for pre-allocating buffers based on batch size
     capacity_hint: usize,
+    decoder_factory: Option<Arc<dyn Fn(&ColumnDescPtr) -> CV + Send + Sync>>,
 }
 
 impl<V, CV> GenericRecordReader<V, CV>
@@ -89,13 +91,29 @@ where
             num_values: 0,
             num_records: 0,
             capacity_hint: capacity,
+            decoder_factory: None,
         }
+    }
+
+    /// Create a new [`GenericRecordReader`] with a custom value decoder
+    /// factory.
+    pub(crate) fn new_with_decoder_factory(
+        desc: ColumnDescPtr,
+        capacity: usize,
+        decoder_factory: Arc<dyn Fn(&ColumnDescPtr) -> CV + Send + Sync>,
+    ) -> Self {
+        let mut reader = Self::new(desc, capacity);
+        reader.decoder_factory = Some(decoder_factory);
+        reader
     }
 
     /// Set the current page reader.
     pub fn set_page_reader(&mut self, page_reader: Box<dyn PageReader>) -> Result<()> {
         let descr = &self.column_desc;
-        let values_decoder = CV::new(descr);
+        let values_decoder = match &self.decoder_factory {
+            Some(factory) => factory(descr),
+            None => CV::new(descr),
+        };
 
         let def_level_decoder = (descr.max_def_level() != 0).then(|| {
             DefinitionLevelBufferDecoder::new(descr.max_def_level(), packed_null_mask(descr))
