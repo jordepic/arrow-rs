@@ -127,7 +127,7 @@ where
         buf: Bytes,
         num_values: u32,
         encoding: Encoding,
-        is_sorted: bool,
+        _is_sorted: bool,
     ) -> Result<()> {
         if !matches!(
             encoding,
@@ -139,15 +139,6 @@ where
             ));
         }
 
-        self.dictionary_filter = None;
-        if !self.predicate.can_evaluate_dictionary() {
-            let mut decoder = ColumnValueDecoderImpl::<T>::new(&self.column_desc);
-            decoder.set_dict(buf, num_values, encoding, is_sorted)?;
-            self.decoder = Some(PrimitivePredicateValueDecoder::Fallback(decoder));
-            return Ok(());
-        }
-
-        self.decoder = None;
         let mut decoder = PlainDecoder::<T>::new(self.column_desc.type_length());
         decoder.set_data(buf, num_values as usize)?;
         let mut values = vec![T::T::default(); num_values as usize];
@@ -177,11 +168,8 @@ where
         num_levels: usize,
         num_values: Option<usize>,
     ) -> Result<()> {
-        let previous_decoder = self.decoder.take();
         self.decoder = Some(match encoding {
-            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                if self.dictionary_filter.is_some() =>
-            {
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
                 let bit_width = data[0];
                 let mut decoder = RleDecoder::new(bit_width);
                 decoder.set_data(data.slice(1..))?;
@@ -191,10 +179,7 @@ where
                 }
             }
             _ => {
-                let mut decoder = match previous_decoder {
-                    Some(PrimitivePredicateValueDecoder::Fallback(decoder)) => decoder,
-                    _ => ColumnValueDecoderImpl::<T>::new(&self.column_desc),
-                };
+                let mut decoder = ColumnValueDecoderImpl::<T>::new(&self.column_desc);
                 decoder.set_data(encoding, data, num_levels, num_values)?;
                 PrimitivePredicateValueDecoder::Fallback(decoder)
             }
@@ -765,14 +750,9 @@ mod tests {
     #[derive(Debug)]
     struct EqualsTwoDictionaryPredicate {
         evaluations: AtomicUsize,
-        evaluate_dictionary: bool,
     }
 
     impl PrimitiveDictionaryPredicate for EqualsTwoDictionaryPredicate {
-        fn can_evaluate_dictionary(&self) -> bool {
-            self.evaluate_dictionary
-        }
-
         fn evaluate(
             &self,
             values: ArrayRef,
@@ -809,10 +789,7 @@ mod tests {
         }
     }
 
-    fn run_primitive_predicate(
-        dictionary_enabled: bool,
-        evaluate_dictionary: bool,
-    ) -> usize {
+    fn run_primitive_predicate(dictionary_enabled: bool) -> usize {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             ArrowType::Int64,
@@ -840,7 +817,6 @@ mod tests {
         let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
         let dictionary_predicate = Arc::new(EqualsTwoDictionaryPredicate {
             evaluations: AtomicUsize::new(0),
-            evaluate_dictionary,
         });
         let filter = RowFilter::new(vec![Box::new(DictionaryPredicate {
             projection,
@@ -871,16 +847,11 @@ mod tests {
 
     #[test]
     fn evaluates_primitive_dictionary_once_for_predicate() {
-        assert_eq!(run_primitive_predicate(true, true), 1);
-    }
-
-    #[test]
-    fn falls_back_for_ineligible_dictionary_predicate() {
-        assert_eq!(run_primitive_predicate(true, false), 3);
+        assert_eq!(run_primitive_predicate(true), 1);
     }
 
     #[test]
     fn evaluates_plain_primitive_values_for_predicate() {
-        assert_eq!(run_primitive_predicate(false, true), 3);
+        assert_eq!(run_primitive_predicate(false), 3);
     }
 }
