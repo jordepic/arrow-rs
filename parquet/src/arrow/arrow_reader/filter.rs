@@ -36,6 +36,20 @@ pub trait PrimitiveDictionaryPredicate: Debug + Send + Sync + 'static {
 
     /// Evaluate this predicate against the dictionary values.
     fn evaluate(&self, values: ArrayRef) -> Result<BooleanArray, ArrowError>;
+
+    /// Evaluate this predicate to one byte per primitive value.
+    ///
+    /// The primitive predicate decoder uses this representation directly while
+    /// combining predicate results with definition levels. Implementations may
+    /// override this method to avoid constructing and then unpacking a
+    /// [`BooleanArray`].
+    fn evaluate_values(&self, values: ArrayRef) -> Result<Vec<u8>, ArrowError> {
+        Ok(self
+            .evaluate(values)?
+            .iter()
+            .map(|value| u8::from(value.unwrap_or(false)))
+            .collect())
+    }
 }
 
 /// A predicate operating on [`RecordBatch`]

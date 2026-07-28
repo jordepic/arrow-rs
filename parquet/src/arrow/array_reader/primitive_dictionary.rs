@@ -99,10 +99,10 @@ where
         }
     }
 
-    fn evaluate_values(&self, values: Vec<T::T>) -> Result<BooleanArray> {
+    fn evaluate_values(&self, values: Vec<T::T>) -> Result<Vec<u8>> {
         let values =
             primitive_array_from_values::<T>(values, &self.value_type, None)?;
-        Ok(self.predicate.evaluate(values)?)
+        Ok(self.predicate.evaluate_values(values)?)
     }
 }
 
@@ -154,12 +154,7 @@ where
                 decoded
             ));
         }
-        self.dictionary_filter = Some(
-            filter
-                .iter()
-                .map(|value| u8::from(value.unwrap_or(false)))
-                .collect(),
-        );
+        self.dictionary_filter = Some(filter);
         Ok(())
     }
 
@@ -219,11 +214,7 @@ where
                         read
                     ));
                 }
-                out.0.extend(
-                    filter
-                        .iter()
-                        .map(|value| u8::from(value.unwrap_or(false))),
-                );
+                out.0.extend(filter);
                 Ok(read)
             }
         }
